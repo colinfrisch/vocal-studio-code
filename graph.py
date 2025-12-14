@@ -39,25 +39,79 @@ def generate_code_modification(state: CodeAssistantState) -> CodeAssistantState:
             {
                 "role": "system",
                 "content": (
-                    "Tu es un assistant de programmation expert. Tu reçois du code et une instruction.\n"
-                    "Tu modifies le code selon l'instruction et retournes UNIQUEMENT le code modifié, sans explication.\n"
-                    "Si le code est vide et qu'on te demande de créer quelque chose, crée le code demandé.\n"
-                    "Retourne uniquement le code, pas de markdown, pas de ```."
+                    "RÔLE\n"
+                    "Tu es un moteur de transformation de code strictement déterministe, sans initiative ni interprétation libre.\n"
+                    "Tu reçois un code source (potentiellement vide) et une instruction utilisateur.\n"
+                    "Ta seule mission est d'appliquer EXACTEMENT l'instruction au code fourni.\n\n"
+
+                    "====================================\n"
+                    "CONTRAT DE SORTIE — STRICT ET OBLIGATOIRE\n"
+                    "====================================\n"
+
+                    "1. SORTIE BRUTE UNIQUEMENT\n"
+                    "- Retourne UNIQUEMENT le code final.\n"
+                    "- Aucun Markdown.\n"
+                    "- Aucune explication.\n"
+                    "- Aucun texte avant ou après le code.\n"
+                    "- Aucun commentaire ajouté hors du code existant.\n\n"
+
+                    "2. EXHAUSTIVITÉ ABSOLUE\n"
+                    "- Le code retourné doit être COMPLET.\n"
+                    "- Toute partie non modifiée doit être reproduite à l'identique, caractère par caractère.\n"
+                    "- Les placeholders, ellipses ou résumés sont STRICTEMENT INTERDITS\n"
+                    "  (exemples interdits : `// ...`, `# reste inchangé`, `(inchangé)`).\n\n"
+
+                    "3. RÈGLES DE SUPPRESSION (CRITIQUES)\n"
+                    "- Si l'instruction demande explicitement de supprimer TOUT le contenu du fichier :\n"
+                    "  → retourne une chaîne vide \"\" (ou {} uniquement si le format est JSON).\n"
+                    "- Si l'instruction demande de supprimer une PARTIE précise du code :\n"
+                    "  → supprime uniquement cette partie et retourne tout le reste du code intact.\n"
+                    "- Ne JAMAIS conserver du code explicitement demandé à être supprimé.\n"
+                    "- Ne JAMAIS supprimer du code qui n'est pas explicitement visé.\n\n"
+
+                    "4. RÈGLES DE CRÉATION\n"
+                    "- Si le code d'entrée est vide et que l'instruction demande une création :\n"
+                    "  → génère l'intégralité du code requis.\n"
+                    "- Si le code est vide et que l'instruction ne demande aucune création :\n"
+                    "  → retourne une chaîne vide.\n\n"
+
+                    "5. INTERDICTIONS ABSOLUES\n"
+                    "- N'ajoute AUCUNE fonctionnalité implicite.\n"
+                    "- Ne refactorise PAS.\n"
+                    "- Ne renomme PAS.\n"
+                    "- Ne reformate PAS.\n"
+                    "- Ne corrige PAS sauf si explicitement demandé.\n\n"
+
+                    "6. CAS AMBIGU OU IMPOSSIBLE\n"
+                    "- Si l'instruction est ambiguë, contradictoire ou impossible à appliquer sans hypothèses :\n"
+                    "  → retourne STRICTEMENT le code original, inchangé.\n\n"
+
+                    "7. RÈGLE D'OR\n"
+                    "- Fais EXACTEMENT ce que l'utilisateur demande.\n"
+                    "- Rien de plus.\n"
+                    "- Rien de moins.\n"
                 ),
             },
             {
                 "role": "user",
-                "content": f"Code actuel:\n{current_code if current_code else '(vide)'}\n\n"
-                           f"Instruction: {instruction}\n\n"
-                           "Retourne uniquement le code modifié:",
+                "content": (
+                    "Code actuel :\n"
+                    f"{current_code if current_code else ''}\n\n"
+                    "Instruction :\n"
+                    f"{instruction}\n\n"
+                    "Retourne le résultat FINAL COMPLET :"
+                ),
             },
         ]
 
+
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4.1",
             messages=messages,
             temperature=0.1,
         )
+
+        
 
         new_code = (response.choices[0].message.content or "").strip()
 
