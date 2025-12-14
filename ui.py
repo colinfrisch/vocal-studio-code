@@ -146,16 +146,27 @@ def create_ui():
             placeholder="Les modifications apparaîtront ici...",
         )
 
+        # State pour stocker le nouveau code sans loading sur l'éditeur
+        new_code_state = gr.State()
+
         audio_input.change(
             fn=process_voice_instruction,
             inputs=[audio_input, code_editor, modifications_display],
-            outputs=[code_editor, status_display, modifications_display],
+            outputs=[new_code_state, status_display, modifications_display],
+        ).then(
+            fn=lambda code: code,
+            inputs=[new_code_state],
+            outputs=[code_editor],
         )
 
         apply_text_btn.click(
             fn=apply_text_instruction,
             inputs=[text_instruction, code_editor, modifications_display],
-            outputs=[code_editor, status_display, modifications_display],
+            outputs=[new_code_state, status_display, modifications_display],
+        ).then(
+            fn=lambda code: code,
+            inputs=[new_code_state],
+            outputs=[code_editor],
         ).then(
             fn=lambda: "",
             outputs=[text_instruction],
