@@ -4,7 +4,7 @@ Interface Gradio pour l'assistant vocal de code.
 
 import gradio as gr
 
-from handlers import process_voice_instruction, apply_text_instruction, clear_all
+from handlers import process_voice_instruction, apply_text_instruction, clear_all, three_way_merge
 
 
 def build_audio_component():
@@ -146,16 +146,43 @@ def create_ui():
             placeholder="Les modifications apparaîtront ici...",
         )
 
+        # States pour le three-way merge
+        original_code_state = gr.State()
+        llm_code_state = gr.State()
+
+        def merge_changes(original, llm_result, current_editor_code, status):
+            """Applique les changements LLM sur le code actuel de l'éditeur."""
+            if original is None or llm_result is None:
+                # Pas de changement (erreur ou pas de résultat)
+                return current_editor_code, status
+            
+            merged, had_conflict = three_way_merge(original, llm_result, current_editor_code)
+            
+            if had_conflict:
+                status = status + " (⚠️ conflit résolu automatiquement)"
+            elif original != current_editor_code:
+                status = status + " (✓ vos modifications conservées)"
+            
+            return merged, status
+
         audio_input.change(
             fn=process_voice_instruction,
             inputs=[audio_input, code_editor, modifications_display],
-            outputs=[code_editor, status_display, modifications_display],
+            outputs=[original_code_state, llm_code_state, status_display, modifications_display],
+        ).then(
+            fn=merge_changes,
+            inputs=[original_code_state, llm_code_state, code_editor, status_display],
+            outputs=[code_editor, status_display],
         )
 
         apply_text_btn.click(
             fn=apply_text_instruction,
             inputs=[text_instruction, code_editor, modifications_display],
-            outputs=[code_editor, status_display, modifications_display],
+            outputs=[original_code_state, llm_code_state, status_display, modifications_display],
+        ).then(
+            fn=merge_changes,
+            inputs=[original_code_state, llm_code_state, code_editor, status_display],
+            outputs=[code_editor, status_display],
         ).then(
             fn=lambda: "",
             outputs=[text_instruction],
