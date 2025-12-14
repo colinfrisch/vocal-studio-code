@@ -3,6 +3,8 @@ Interface Gradio pour Vocal Studio Code.
 Utilise l'enregistrement continu avec détection de fin de parole (VAD).
 """
 
+import os
+import base64
 import uuid
 import numpy as np
 import gradio as gr
@@ -10,6 +12,19 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from handlers import process_voice_instruction, three_way_merge
+
+# Charger le logo en base64
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_PATH = os.path.join(APP_DIR, "logo.png")
+
+def load_logo_base64():
+    try:
+        with open(LOGO_PATH, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    except Exception:
+        return ""
+
+LOGO_BASE64 = load_logo_base64()
 
 # =========================
 # CONFIG VAD (Voice Activity Detection)
@@ -312,16 +327,14 @@ def reset_voice_state(voice_state: VoiceStreamState):
 
 def create_ui():
     with gr.Blocks(title="Vocal Studio Code", css=CUSTOM_CSS) as demo:
-        gr.HTML("""
+        gr.HTML(f"""
             <div style="text-align: center; padding: 20px;">
-                <h1 style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                           -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-                           font-size: 2.5em; font-weight: bold;">
-                    Vocal Studio Code
-                </h1>
-                <p style="color: #888; font-size: 1.1em;">
-                    Parlez pour modifier votre code • Propulsé par Gradium.ai + OpenAI GPT
-                </p>
+                <div style="display: inline-flex; align-items: center; gap: 16px;">
+                    <img src="data:image/png;base64,{LOGO_BASE64}" alt="Vocal Studio Code" style="width: 200px; height: 200px;">
+                    <h1 style="color: #2180C2; font-size: 4em; font-weight: bold; margin: 0;">
+                        Vocal Studio Code
+                    </h1>
+                </div>
             </div>
         """)
 
