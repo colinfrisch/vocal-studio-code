@@ -1,25 +1,127 @@
 """
-Interface Gradio pour l'assistant vocal de code.
+Interface Gradio pour Vocal Studio Code.
+Utilise l'enregistrement continu avec détection de fin de parole (VAD).
 """
 
+import uuid
+import numpy as np
 import gradio as gr
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
-from handlers import process_voice_instruction, apply_text_instruction, clear_all, three_way_merge
+from handlers import process_voice_instruction, three_way_merge
+
+# =========================
+# CONFIG VAD (Voice Activity Detection)
+# =========================
+TARGET_SR = 24000
+DEFAULT_SILENCE_SECONDS = 0.70  # Silence avant envoi
+DEFAULT_RMS_THRESHOLD = 0.015   # Seuil de détection de voix
+MIN_UTTERANCE_SECONDS = 0.25    # Durée minimale pour envoyer
+
+
+# =========================
+# AUDIO UTILS
+# =========================
+def to_mono(x: np.ndarray) -> np.ndarray:
+    if x is None:
+        return np.zeros((0,), dtype=np.float32)
+    if x.ndim == 1:
+        return x
+    if x.ndim == 2:
+        return x.mean(axis=1)
+    return x.reshape(-1)
+
+
+def resample_linear(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    if sr_in == sr_out:
+        return x.astype(np.float32, copy=False)
+    x = x.astype(np.float32, copy=False)
+    n_in = x.shape[0]
+    if n_in == 0:
+        return x
+    duration = n_in / float(sr_in)
+    n_out = int(round(duration * sr_out))
+    if n_out <= 1:
+        return np.zeros((0,), dtype=np.float32)
+    t_in = np.linspace(0.0, duration, num=n_in, endpoint=False, dtype=np.float32)
+    t_out = np.linspace(0.0, duration, num=n_out, endpoint=False, dtype=np.float32)
+    return np.interp(t_out, t_in, x).astype(np.float32)
+
+
+def rms(x: np.ndarray) -> float:
+    if x.size == 0:
+        return 0.0
+    xf = x.astype(np.float32, copy=False)
+    return float(np.sqrt(np.mean(xf * xf) + 1e-12))
+
+
+# =========================
+# STATE pour l'enregistrement continu
+# =========================
+@dataclass
+class VoiceStreamState:
+    session_id: str = ""
+    buffer_chunks: List[List[float]] = field(default_factory=list)  # Stocké en list pour eviter les problèmes de deepcopy
+    buffer_sr: int = 0
+    silence_s: float = 0.0
+    saw_voice: bool = False
+    pending_audio_list: Optional[List[float]] = None  # Audio prêt à traiter (stocké en list)
+    pending_audio_sr: int = 0
+    status_message: str = "En attente..."
+
+
+def new_voice_state() -> VoiceStreamState:
+    return VoiceStreamState(session_id=str(uuid.uuid4()))
+
+
+def append_chunk(state: VoiceStreamState, chunk_f: np.ndarray, sr: int):
+    state.buffer_chunks.append(chunk_f.astype(np.float32, copy=False).tolist())
+    state.buffer_sr = sr
+
+
+def concat_chunks(state: VoiceStreamState) -> np.ndarray:
+    if not state.buffer_chunks:
+        return np.zeros((0,), dtype=np.float32)
+    arrays = [np.asarray(c, dtype=np.float32) for c in state.buffer_chunks]
+    return np.concatenate(arrays, axis=0)
+
+
+def set_pending_audio(state: VoiceStreamState, sr: int, audio: np.ndarray):
+    """Stocke l'audio prêt à traiter (converti en list pour deepcopy)."""
+    state.pending_audio_list = audio.astype(np.float32, copy=False).tolist()
+    state.pending_audio_sr = sr
+
+
+def get_pending_audio(state: VoiceStreamState) -> Optional[Tuple[int, np.ndarray]]:
+    """Récupère l'audio en attente et le convertit en numpy."""
+    if state.pending_audio_list is None:
+        return None
+    audio = np.asarray(state.pending_audio_list, dtype=np.float32)
+    return (state.pending_audio_sr, audio)
+
+
+def clear_pending_audio(state: VoiceStreamState):
+    """Efface l'audio en attente."""
+    state.pending_audio_list = None
+    state.pending_audio_sr = 0
 
 
 def build_audio_component():
+    """Composant audio en mode streaming continu."""
     try:
         return gr.Audio(
-            sources=["microphone", "upload"],
+            sources=["microphone"],
             type="numpy",
-            label="Cliquez pour enregistrer",
-            streaming=False,
+            label="🎤 Parlez (enregistrement continu)",
+            streaming=True,
         )
     except TypeError:
         return gr.Audio(
             source="microphone",
             type="numpy",
-            label="Cliquez pour enregistrer",
+            label="🎤 Parlez (enregistrement continu)",
+            streaming=True,
         )
 
 
@@ -82,14 +184,140 @@ CUSTOM_CSS = """
 """
 
 
+# =========================
+# CALLBACK AUDIO STREAMING (VAD)
+# =========================
+def on_audio_stream(
+    audio: Optional[Tuple[int, np.ndarray]],
+    voice_state: VoiceStreamState,
+    silence_seconds: float,
+    rms_threshold: float,
+):
+    """
+    Traite chaque chunk audio en streaming.
+    Détecte la voix et le silence pour déclencher l'envoi uniquement à la fin de parole.
+    
+    Retourne: (voice_state, status_message)
+    """
+    state = voice_state or new_voice_state()
+    
+    if audio is None:
+        return state, state.status_message
+    
+    sr_in, chunk = audio
+    chunk = to_mono(chunk)
+    
+    # Normaliser en float32
+    if np.issubdtype(chunk.dtype, np.integer):
+        max_val = np.iinfo(chunk.dtype).max
+        chunk_f = (chunk.astype(np.float32) / float(max_val)).astype(np.float32)
+    else:
+        chunk_f = np.clip(chunk.astype(np.float32, copy=False), -1.0, 1.0)
+    
+    current_rms = rms(chunk_f)
+    is_voice = current_rms >= float(rms_threshold)
+    
+    # Accumuler le chunk
+    append_chunk(state, chunk_f, sr_in)
+    dur_chunk = float(chunk_f.shape[0]) / float(sr_in) if sr_in else 0.0
+    
+    if is_voice:
+        if not state.saw_voice:
+            state.status_message = "🎙️ Parole détectée..."
+        state.saw_voice = True
+        state.silence_s = 0.0
+    elif state.saw_voice:
+        state.silence_s += dur_chunk
+        remaining = max(0, float(silence_seconds) - state.silence_s)
+        state.status_message = f"🎙️ Parole en cours... (silence: {state.silence_s:.1f}s)"
+    
+    if not state.saw_voice:
+        state.status_message = "En attente de parole..."
+        return state, state.status_message
+    
+    # Vérifier si le silence est suffisant pour déclencher l'envoi
+    if state.silence_s >= float(silence_seconds):
+        full = concat_chunks(state)
+        
+        # Reset l'état VAD
+        state.buffer_chunks = []
+        state.silence_s = 0.0
+        state.saw_voice = False
+        
+        # Rééchantillonner à la fréquence cible
+        full_resampled = resample_linear(full, sr_in=int(state.buffer_sr or sr_in), sr_out=TARGET_SR)
+        utt_seconds = float(full_resampled.shape[0]) / float(TARGET_SR) if full_resampled.size else 0.0
+        
+        if utt_seconds < MIN_UTTERANCE_SECONDS:
+            state.status_message = f"Audio trop court ({utt_seconds:.2f}s), ignoré."
+            return state, state.status_message
+        
+        # Stocker l'audio prêt à traiter (en list pour éviter les problèmes de deepcopy)
+        set_pending_audio(state, TARGET_SR, full_resampled)
+        state.status_message = f"✅ Fin de parole détectée ({utt_seconds:.1f}s). Traitement..."
+    
+    return state, state.status_message
+
+
+def process_pending_audio_and_merge(
+    voice_state: VoiceStreamState,
+    current_code: str,
+    modifications_history: str,
+):
+    """
+    Traite l'audio en attente si disponible ET applique le merge.
+    Retourne: (code_editor, status, history, voice_state)
+    
+    Utilise gr.update() pour ne PAS rafraîchir l'éditeur quand il n'y a pas de changement.
+    """
+    state = voice_state or new_voice_state()
+    
+    # Récupérer l'audio en attente
+    audio = get_pending_audio(state)
+    if audio is None:
+        # Pas d'audio à traiter - NE PAS mettre à jour l'éditeur
+        return gr.update(), gr.update(), gr.update(), state
+    
+    # Effacer l'audio en attente
+    clear_pending_audio(state)
+    
+    # Appeler le handler existant
+    original, llm_code, status, history = process_voice_instruction(
+        audio, current_code, modifications_history
+    )
+    
+    state.status_message = status
+    
+    # Si pas de résultat du LLM, ne pas mettre à jour l'éditeur
+    if original is None or llm_code is None:
+        return gr.update(), status, history, state
+    
+    # Appliquer le merge
+    merged, had_conflict = three_way_merge(original, llm_code, current_code)
+    
+    if had_conflict:
+        status = status + " (⚠️ conflit résolu automatiquement)"
+    elif original != current_code:
+        status = status + " (✓ vos modifications conservées)"
+    
+    return merged, status, history, state
+
+
+def reset_voice_state(voice_state: VoiceStreamState):
+    """Réinitialise l'état de l'enregistrement vocal."""
+    new_state = new_voice_state()
+    new_state.status_message = "🔄 État audio réinitialisé. En attente..."
+    return new_state, new_state.status_message
+
+
 def create_ui():
-    with gr.Blocks(title="Assistant Vocal de Code", css=CUSTOM_CSS) as demo:
+    with gr.Blocks(title="Vocal Studio Code", css=CUSTOM_CSS) as demo:
         gr.HTML("""
             <div style="text-align: center; padding: 20px;">
                 <h1 style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
                            font-size: 2.5em; font-weight: bold;">
-                    Assistant Vocal de Code
+                    Vocal Studio Code
                 </h1>
                 <p style="color: #888; font-size: 1.1em;">
                     Parlez pour modifier votre code • Propulsé par Gradium.ai + OpenAI GPT
@@ -108,8 +336,18 @@ def create_ui():
                 )
 
             with gr.Column(scale=1):
-                gr.HTML("<h3 style='color: #667eea;'>Enregistrement Vocal</h3>")
+                gr.HTML("<h3 style='color: #667eea;'>🎤 Enregistrement Vocal Continu</h3>")
                 audio_input = build_audio_component()
+                
+                with gr.Row():
+                    silence_slider = gr.Slider(
+                        minimum=0.30, maximum=1.50, value=DEFAULT_SILENCE_SECONDS, step=0.05,
+                        label="Silence (s) avant envoi"
+                    )
+                    rms_slider = gr.Slider(
+                        minimum=0.003, maximum=0.060, value=DEFAULT_RMS_THRESHOLD, step=0.001,
+                        label="Seuil de détection voix"
+                    )
 
                 status_display = gr.Textbox(
                     label="Statut",
@@ -119,22 +357,15 @@ def create_ui():
                     elem_classes=["status-box"],
                 )
 
-                mic_test_btn = gr.Button("Tester l'accès micro", variant="secondary")
+                with gr.Row():
+                    mic_test_btn = gr.Button("Tester micro", variant="secondary", size="sm")
+                    reset_audio_btn = gr.Button("Reset audio", variant="secondary", size="sm")
+                
                 mic_test_btn.click(
                     fn=lambda: "Test micro lancé…",
                     outputs=status_display,
                     js=MIC_TEST_JS,
                 )
-
-                gr.HTML("<h3 style='color: #667eea; margin-top: 20px;'>Instruction Textuelle</h3>")
-                text_instruction = gr.Textbox(
-                    label="Tapez votre instruction",
-                    placeholder="Ex: Ajoute une gestion d'erreur...",
-                    lines=2,
-                )
-
-                apply_text_btn = gr.Button("Appliquer", variant="primary")
-                clear_btn = gr.Button("Tout effacer", variant="secondary")
 
         gr.HTML("<h3 style='color: #667eea; margin-top: 20px;'>Historique des Modifications</h3>")
         modifications_display = gr.Textbox(
@@ -146,51 +377,33 @@ def create_ui():
             placeholder="Les modifications apparaîtront ici...",
         )
 
-        # States pour le three-way merge
-        original_code_state = gr.State()
-        llm_code_state = gr.State()
+        # States
+        voice_state = gr.State(new_voice_state())
 
-        def merge_changes(original, llm_result, current_editor_code, status):
-            """Applique les changements LLM sur le code actuel de l'éditeur."""
-            if original is None or llm_result is None:
-                # Pas de changement (erreur ou pas de résultat)
-                return current_editor_code, status
-            
-            merged, had_conflict = three_way_merge(original, llm_result, current_editor_code)
-            
-            if had_conflict:
-                status = status + " (⚠️ conflit résolu automatiquement)"
-            elif original != current_editor_code:
-                status = status + " (✓ vos modifications conservées)"
-            
-            return merged, status
-
-        audio_input.change(
-            fn=process_voice_instruction,
-            inputs=[audio_input, code_editor, modifications_display],
-            outputs=[original_code_state, llm_code_state, status_display, modifications_display],
-        ).then(
-            fn=merge_changes,
-            inputs=[original_code_state, llm_code_state, code_editor, status_display],
-            outputs=[code_editor, status_display],
+        # Streaming audio: traite chaque chunk pour la détection de voix/silence
+        audio_input.stream(
+            fn=on_audio_stream,
+            inputs=[audio_input, voice_state, silence_slider, rms_slider],
+            outputs=[voice_state, status_display],
+            show_progress="hidden",
+            concurrency_limit=32,
         )
 
-        apply_text_btn.click(
-            fn=apply_text_instruction,
-            inputs=[text_instruction, code_editor, modifications_display],
-            outputs=[original_code_state, llm_code_state, status_display, modifications_display],
-        ).then(
-            fn=merge_changes,
-            inputs=[original_code_state, llm_code_state, code_editor, status_display],
-            outputs=[code_editor, status_display],
-        ).then(
-            fn=lambda: "",
-            outputs=[text_instruction],
+        # Timer pour vérifier si un audio est prêt à être traité
+        # Utilise gr.update() pour ne PAS rafraîchir l'éditeur quand il n'y a pas de changement
+        audio_timer = gr.Timer(0.15)
+        audio_timer.tick(
+            fn=process_pending_audio_and_merge,
+            inputs=[voice_state, code_editor, modifications_display],
+            outputs=[code_editor, status_display, modifications_display, voice_state],
+            show_progress="hidden",
         )
 
-        clear_btn.click(
-            fn=clear_all,
-            outputs=[code_editor, status_display, modifications_display],
+        # Reset de l'état audio
+        reset_audio_btn.click(
+            fn=reset_voice_state,
+            inputs=[voice_state],
+            outputs=[voice_state, status_display],
         )
 
     return demo
